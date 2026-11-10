@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,8 @@ HISTORY = "thread_history_1.sqlite"
 INDEX = "session_index.jsonl"
 SIDEBAR = ".codex-global-state.json"
 SESSION_DIRS = {"sessions", "archived_sessions"}
+SECTIONS = "thread_sections"
+SKILL_PREFIX = "user-skills"
 STATE_TABLES = ("projects", "project_roots", "threads", "thread_dynamic_tools",
                 "thread_spawn_edges")
 HISTORY_TABLES = ("thread_turns", "thread_items", "thread_history_projection_state",
@@ -150,7 +153,7 @@ def discover(db, home):
                     (r["project_id"] for r in roots if below(meta.get("cwd", ""), r["path"])), None)
                 if owner:
                     owners.setdefault(meta["id"], owner)
-    wanted = set(owners)
+    wanted = set(owners) | {key for key, row in threads.items() if row.get("thread_section_id")}
     queue = deque(wanted)
     while queue:
         for dependency in edges[queue.popleft()] - wanted:
@@ -172,7 +175,7 @@ def discover(db, home):
         else:
             row["rollout_path"] = candidates[0].relative_to(home).as_posix()
             row["project_id"] = owners.get(key)
-            for field in ("creator_account_id", "creator_user_id", "thread_section_id"):
+            for field in ("creator_account_id", "creator_user_id"):
                 if field in row:
                     row[field] = None
     return projects, roots, threads, wanted, selected, problems
@@ -208,7 +211,48 @@ def index_lines(path):
                 yield json.loads(line)
 
 
-def export(home, archive, preview):
+def skill_roots(home):
+    return {"codex": home / "skills", "agents": Path.home() / ".agents" / "skills"}
+
+
+def is_link(path):
+    return path.is_symlink() or path.is_junction()
+
+
+def raise_walk_error(error):
+    raise error
+
+
+def skill_files(folder):
+    files = {}
+    for directory, dirs, names in folder.walk(on_error=raise_walk_error):
+        for name in dirs:
+            if is_link(directory / name):
+                raise ValueError(f"Skill contains a link: {directory / name}")
+        for name in names:
+            entry = directory / name
+            if is_link(entry) or not entry.is_file():
+                raise ValueError(f"Invalid or linked skill file: {entry}")
+            files[entry.relative_to(folder)] = entry
+    return files
+
+
+def collect_skills(home):
+    skills = {}
+    for scope, root in skill_roots(home).items():
+        if is_link(root) or is_link(root.parent):
+            raise ValueError(f"Skill root is a link: {root}")
+        if not root.is_dir():
+            continue
+        for folder in root.iterdir():
+            if not folder.name.startswith(".") and folder.is_dir() and (folder / "SKILL.md").is_file():
+                if is_link(folder):
+                    raise ValueError(f"Skill directory is a link: {folder}")
+                skills[scope, folder.name] = skill_files(folder)
+    return skills
+
+
+def export(home, archive, preview, include_skills=True):
     if not preview:
         require_stopped()
     with closing(read_db(home / STATE)) as state:
@@ -220,8 +264,11 @@ def export(home, archive, preview):
             print(problem)
         if problems:
             raise ValueError(f"{len(problems)} history problems. No bundle created.")
-        if not projects or not files:
-            raise ValueError("No local project conversations found.")
+        if not files:
+            raise ValueError("No local project or section conversations found.")
+        skills = collect_skills(home) if include_skills else {}
+        if include_skills:
+            print(f"{len(skills)} user skills selected.")
         if preview:
             return
         if archive.exists():
@@ -240,6 +287,11 @@ def export(home, archive, preview):
             add_ids(state, "picked", wanted)
             with closing(sqlite3.connect(work / STATE)) as subset:
                 export_tables(state, subset, STATE_TABLES, state_filter, threads)
+                if state.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                                 (SECTIONS,)).fetchone():
+                    export_tables(state, subset, (SECTIONS,), {
+                        SECTIONS: "1 ORDER BY rowid",
+                    })
                 subset.commit()
             with closing(read_db(home / HISTORY)) as history, \
                     closing(sqlite3.connect(work / HISTORY)) as subset:
@@ -258,12 +310,15 @@ def export(home, archive, preview):
                     zip_file.write(work / name, name)
                 for path in sorted(files):
                     zip_file.write(path, path.relative_to(home).as_posix())
+                for (scope, folder), entries in sorted(skills.items()):
+                    for relative, path in sorted(entries.items()):
+                        zip_file.write(path, f"{SKILL_PREFIX}/{scope}/{folder}/{relative.as_posix()}")
             require_stopped()
             os.rename(package, archive)
         print(f"Saved {archive}")
 
 
-def unpack(archive, work):
+def unpack(archive, work, include_skills):
     required = {"manifest.json", STATE, HISTORY, INDEX}
     with zipfile.ZipFile(archive) as bundle:
         names = set()
@@ -271,12 +326,17 @@ def unpack(archive, work):
             name = entry.filename
             path = PurePosixPath(name)
             if name.casefold() in names or path.as_posix() != name or path.is_absolute() or \
-                    ".." in path.parts or ":" in name or "\\" in name or entry.is_dir():
+                    ".." in path.parts or any(os.path.isreserved(part) for part in path.parts) or "\\" in name or \
+                    entry.is_dir() or stat.S_ISLNK(entry.external_attr >> 16):
                 raise ValueError(f"Invalid archive entry: {name}")
             names.add(name.casefold())
-            if name not in required and not (len(path.parts) >= 2 and path.parts[0] in SESSION_DIRS
-                                              and ROLLOUT.fullmatch(path.name)):
+            is_skill = (len(path.parts) >= 4 and path.parts[0] == SKILL_PREFIX
+                        and path.parts[1] in {"codex", "agents"} and not path.parts[2].startswith("."))
+            if name not in required and not is_skill and not (
+                    len(path.parts) >= 2 and path.parts[0] in SESSION_DIRS and ROLLOUT.fullmatch(path.name)):
                 raise ValueError(f"Unexpected archive entry: {name}")
+            if is_skill and not include_skills:
+                continue
             target = work.joinpath(*path.parts)
             if not target.resolve().is_relative_to(work.resolve()):
                 raise ValueError(f"Unsafe archive entry: {name}")
@@ -292,11 +352,56 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").digest()
 
 
+def plan_skills(home, work):
+    planned = {}
+    for scope, root in skill_roots(home).items():
+        incoming = work / SKILL_PREFIX / scope
+        if not incoming.is_dir():
+            continue
+        if any(is_link(path) or (path.exists() and not path.is_dir()) for path in (root.parent, root)):
+            raise ValueError(f"Unsafe skill destination: {root}")
+        for folder in sorted(incoming.iterdir()):
+            if not (folder / "SKILL.md").is_file():
+                raise ValueError(f"Missing SKILL.md in skill: {folder.name}")
+            target = root / folder.name
+            entries = skill_files(folder)
+            if is_link(target) or (target.exists() and not target.is_dir()):
+                print(f"Skill conflict, kept destination: {target}")
+            elif target.is_dir():
+                existing = skill_files(target)
+                if existing.keys() != entries.keys() or any(
+                        digest(existing[path]) != digest(entries[path]) for path in entries):
+                    print(f"Skill conflict, kept destination: {target}")
+            else:
+                planned[target] = entries
+    return planned
+
+
 def merge_row(db, schema, table, row):
     columns = ",".join(map(quote, row.keys()))
     placeholders = ",".join("?" for _ in row)
     db.execute(f"INSERT INTO {schema}.{quote(table)} ({columns}) VALUES ({placeholders})",
                tuple(row.values()))
+
+
+def merge_sections(db, source):
+    if not source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (SECTIONS,)).fetchone():
+        return set()
+    sections = list(source.execute(f"SELECT * FROM {SECTIONS} ORDER BY rowid"))
+    if not sections:
+        return set()
+    incoming = set(sections[0].keys())
+    target = {column[1] for column in db.execute(f"PRAGMA table_info({SECTIONS})")}
+    if incoming != target:
+        raise ValueError(f"Incompatible Codex schema for {SECTIONS}. Use matching Codex versions.")
+    existing = {key for key, in db.execute(f"SELECT id FROM {SECTIONS}")}
+    created = set()
+    for section in sections:
+        key = section["id"]
+        if key not in existing:
+            merge_row(db, "main", SECTIONS, dict(section))
+            created.add(key)
+    return created
 
 
 def import_rows(db, work, home, provider):
@@ -332,6 +437,7 @@ def import_rows(db, work, home, provider):
             merge_row(db, "main", "projects", row)
             for root in roots[key]:
                 merge_row(db, "main", "project_roots", root)
+        new_sections = merge_sections(db, source)
         existing = {r[0]: (r[1], r[2]) for r in db.execute("SELECT id, rollout_path, project_id FROM threads")}
         imported = set()
         memberships = {}
@@ -351,6 +457,11 @@ def import_rows(db, work, home, provider):
                     memberships[key] = project
                     if not current_project:
                         db.execute("UPDATE threads SET project_id=? WHERE id=?", (project, key))
+                if row.get("thread_section_id") in new_sections:
+                    db.execute("UPDATE threads SET thread_section_id=?, section_position=?, "
+                               "section_entered_at_ms=? WHERE id=? AND thread_section_id IS NULL",
+                               (row["thread_section_id"], row["section_position"],
+                                row["section_entered_at_ms"], key))
                 continue
             row["rollout_path"] = str(home / relative)
             row["project_id"] = project_map.get(row["project_id"])
@@ -429,11 +540,14 @@ def merge_sidebar(original, db, home, project_ids, memberships):
     return json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def import_bundle(home, archive, preview, provider):
+def import_bundle(home, archive, preview, provider, include_skills=True):
     require_stopped()
     with tempfile.TemporaryDirectory(prefix="codex-transfer-", dir=archive.parent) as temp:
         work = Path(temp)
-        unpack(archive, work)
+        unpack(archive, work, include_skills)
+        skills = plan_skills(home, work) if include_skills else {}
+        if include_skills:
+            print(f"{len(skills)} new user skills.")
         additions = []
         for folder in SESSION_DIRS:
             for path in (work / folder).rglob("*"):
@@ -500,6 +614,26 @@ def import_bundle(home, archive, preview, provider):
                     if not directory.is_dir():
                         directory.mkdir()
                         created_dirs.append(directory)
+            for target, entries in skills.items():
+                for directory in reversed(target.parents):
+                    if not directory.is_dir():
+                        directory.mkdir()
+                        created_dirs.append(directory)
+                if any(is_link(path) for path in (target.parent, target.parent.parent)):
+                    raise ValueError(f"Unsafe skill destination: {target}")
+                target.mkdir()
+                created_dirs.append(target)
+                for relative, source in entries.items():
+                    path = target / relative
+                    for directory in reversed(relative.parents):
+                        parent = target / directory
+                        if not parent.is_dir():
+                            parent.mkdir()
+                            created_dirs.append(parent)
+                    with path.open("xb") as output:
+                        created.append(path)
+                        with source.open("rb") as incoming:
+                            shutil.copyfileobj(incoming, output)
             for source, target in additions:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with target.open("xb") as output:
@@ -561,6 +695,12 @@ def main():
     parser.add_argument("--codex-home", type=Path, default=Path(os.environ.get(
         "CODEX_HOME", str(Path.home() / ".codex"))))
     parser.add_argument("--preview", action="store_true")
+    skill_options = parser.add_mutually_exclusive_group()
+    skill_options.add_argument("--include-skills", dest="include_skills", action="store_true",
+                               help="Transfer user skills (default)")
+    skill_options.add_argument("--exclude-skills", dest="include_skills", action="store_false",
+                               help="Skip user skills during export or import")
+    parser.set_defaults(include_skills=True)
     parser.add_argument("--provider", help="Optional target model_provider for imported thread rows")
     if len(sys.argv) == 1:
         parser.print_help()
@@ -568,9 +708,9 @@ def main():
     args = parser.parse_args()
     home, archive = args.codex_home.resolve(), args.archive.resolve()
     if args.mode == "export":
-        export(home, archive, args.preview)
+        export(home, archive, args.preview, args.include_skills)
     else:
-        import_bundle(home, archive, args.preview, args.provider)
+        import_bundle(home, archive, args.preview, args.provider, args.include_skills)
 
 
 if __name__ == "__main__":
