@@ -18,6 +18,16 @@
 
 以下命令在 PowerShell 和 Git Bash 中都可用。若 `python` 指向旧版本，可以换成 `py -3.14`。
 
+### 桌面窗口
+
+```text
+python codex-project-conversation-transfer.py
+```
+
+窗口提供导出、导入、清理三个入口，可选择 Codex 数据目录和 ZIP，并查看运行记录。Skills 默认勾选。耗时操作在后台运行，任务结束后可继续操作。
+
+清理需先点「预览」，核对列表后再点「清理预览中的文件」并确认。正式迁移和清理前请完全退出 Codex。窗口使用 Python 自带的 Tkinter。
+
 ### 导出
 
 在旧电脑上进入脚本所在目录，完全退出 Codex，再运行：
@@ -65,10 +75,23 @@ python codex-project-conversation-transfer.py import codex-chats-only.zip --excl
 
 脚本会处理 Codex 数据目录下的 `skills` 和用户目录下的 `.agents/skills`，只打包包含 `SKILL.md` 的用户技能目录及其支持文件。仓库内 Skills 继续随 Git 同步，内置 `.system` 目录会跳过。导入发现同名内容不同时会保留新机版本并提示冲突。Skills 可以包含可执行脚本或私人配置，请先检查来源和内容。
 
+### 清理旧备份和临时文件
+
+先预览，再完全退出 Codex 并执行删除：
+
+```text
+python codex-project-conversation-transfer.py cleanup
+python codex-project-conversation-transfer.py cleanup --apply
+```
+
+清理范围为超过 7 天的本脚本导入备份和 Codex 全局状态写入临时文件。最新一份导入备份始终保留。目录或其内部文件最近 7 天有变动时会跳过，含未知文件或链接的备份目录也会跳过。删除的旧备份会失去对应的回退能力。
+
+会话、正式数据库、Skills、配置、浏览器数据、导出的 ZIP 和其他工具的备份会保留。`cleanup` 默认只打印路径和可释放大小，`--apply` 才会永久删除列出的项。
+
 ### 帮助和预览
 
 ```text
-python codex-project-conversation-transfer.py
+python codex-project-conversation-transfer.py --help
 python codex-project-conversation-transfer.py export --preview
 python codex-project-conversation-transfer.py import codex-chats.zip --preview
 ```
@@ -86,6 +109,16 @@ Transfer local Codex project and sidebar Section conversations between Windows c
 - Quit Codex Desktop, the CLI, and any Codex IDE sessions before transferring. Allow space for the archive, temporary files, and destination backups.
 
 The commands below work in PowerShell and Git Bash. Use `py -3.14` if `python` points to an older version.
+
+### Desktop window
+
+```text
+python codex-project-conversation-transfer.py
+```
+
+The Chinese-language desktop window provides export, import, and cleanup controls, directory and ZIP pickers, a Skills checkbox enabled by default, and a live activity log. Operations run in the background while the controls are locked.
+
+For cleanup, preview the candidates first, then select the cleanup button and confirm deletion. Fully quit Codex before transferring or deleting files. The window uses Python's bundled Tkinter.
 
 ### Export
 
@@ -124,10 +157,23 @@ python codex-project-conversation-transfer.py import codex-chats-only.zip --excl
 
 The script looks for user skill folders containing `SKILL.md` in the Codex data directory's `skills` folder and the user's `.agents/skills`. Each selected folder's supporting files travel with it. Repository skills stay with Git, and built-in `.system` skills are skipped. If a same-name destination skill differs, the importer reports a conflict and keeps the destination copy. Review skill contents and provenance before transferring executable scripts or private configuration.
 
+### Clean up old backups and temporary files
+
+Preview first, then fully quit Codex before applying the cleanup:
+
+```text
+python codex-project-conversation-transfer.py cleanup
+python codex-project-conversation-transfer.py cleanup --apply
+```
+
+Cleanup selects this script's import backups and Codex global-state write temporary files older than seven days. The newest import backup is always kept. Recently modified directories or files, backups with unexpected contents, and links are skipped. Deleting an old backup removes its corresponding rollback option.
+
+Conversations, active databases, Skills, configuration, browser data, exported ZIPs, and other tools' backups are retained. The default command lists candidates and their size. `--apply` permanently deletes the listed candidates.
+
 ### Help and preview
 
 ```text
-python codex-project-conversation-transfer.py
+python codex-project-conversation-transfer.py --help
 python codex-project-conversation-transfer.py export --preview
 python codex-project-conversation-transfer.py import codex-chats.zip --preview
 ```

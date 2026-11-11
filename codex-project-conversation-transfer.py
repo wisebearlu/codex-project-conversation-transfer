@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import queue
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -11,6 +12,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import zipfile
 from collections import defaultdict, deque
 from compression import zstd
@@ -31,6 +34,11 @@ HISTORY_TABLES = ("thread_turns", "thread_items", "thread_history_projection_sta
                   "thread_realtime_items")
 UUID = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
 ROLLOUT = re.compile(rf"rollout-.*?-({UUID})(?:_({UUID}))?\.jsonl(?:\.zst)?$", re.I)
+CLEANUP_DAYS = 7
+BACKUP_NAME = re.compile(r"conversation-transfer-backup-\d{8}-\d{6}-\d{6}$")
+STATE_TEMP_NAME = re.compile(
+    rf"\.\.codex-global-state\.json(?:\.bak)?\.tmp-\d+-{UUID}$", re.I)
+BACKUP_FILES = {STATE, HISTORY, INDEX, SIDEBAR, "new-index.tmp", "new-sidebar.tmp"}
 
 
 def require_stopped():
@@ -686,15 +694,319 @@ def import_bundle(home, archive, preview, provider, include_skills=True):
         print(f"Imported. Backup: {backup}. Open Codex and check the original chats.")
 
 
+def cleanup_snapshot(path):
+    if is_link(path):
+        raise ValueError(f"Cleanup skips links: {path}")
+    entries = [path]
+    if path.is_dir():
+        entries.extend(sorted(path.iterdir()))
+        if any(entry.name not in BACKUP_FILES or not entry.is_file() or is_link(entry)
+               for entry in entries[1:]):
+            raise ValueError(f"Cleanup skips backup with unexpected contents: {path}")
+    elif not path.is_file():
+        raise ValueError(f"Cleanup skips special file: {path}")
+    snapshot = {}
+    for entry in entries:
+        info = entry.stat()
+        snapshot[entry] = (info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode)
+    return snapshot
+
+
+def cleanup(home, apply=False):
+    if not home.is_dir():
+        raise ValueError(f"Missing Codex directory: {home}")
+    cutoff = time.time_ns() - CLEANUP_DAYS * 24 * 60 * 60 * 1_000_000_000
+    children = list(home.iterdir())
+    backups = sorted((path for path in children if BACKUP_NAME.fullmatch(path.name)),
+                     key=lambda path: path.name, reverse=True)
+    protected = backups[0] if backups else None
+    candidates = []
+    total_bytes = 0
+    for path in sorted(children):
+        if path == protected:
+            continue
+        is_backup = bool(BACKUP_NAME.fullmatch(path.name))
+        if not is_backup and not STATE_TEMP_NAME.fullmatch(path.name):
+            continue
+        try:
+            if is_backup and not path.is_dir():
+                raise ValueError(f"Cleanup skips invalid backup directory: {path}")
+            if not is_backup and not path.is_file():
+                raise ValueError(f"Cleanup skips invalid temporary file: {path}")
+            snapshot = cleanup_snapshot(path)
+            if any(info[2] >= cutoff for info in snapshot.values()):
+                continue
+        except (ValueError, OSError) as error:
+            print(error)
+            continue
+        size = sum(info[1] for entry, info in snapshot.items() if entry.is_file())
+        total_bytes += size
+        candidates.append((path, snapshot))
+        print(f"Cleanup candidate: {path.name} ({size:,} bytes)")
+    print(f"{len(candidates)} cleanup candidates, {total_bytes:,} bytes.")
+    if protected:
+        print(f"Keeping newest import backup: {protected.name}")
+    if not apply:
+        print("Preview only. Use cleanup --apply to delete these old files.")
+        return
+    require_stopped()
+    for path, snapshot in candidates:
+        if not path.resolve().is_relative_to(home.resolve()) or cleanup_snapshot(path) != snapshot:
+            raise ValueError(f"Cleanup candidate changed; stopped: {path}")
+        if path.is_dir():
+            for entry in snapshot:
+                if entry != path:
+                    entry.unlink()
+            path.rmdir()
+        else:
+            path.unlink()
+        print(f"Deleted: {path.name}")
+
+
+def launch_gui():
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    class TransferWindow:
+        def __init__(self, root):
+            self.root = root
+            self.running = False
+            self.cleanup_preview = None
+            self.events = queue.Queue()
+            self.root.title("Codex 项目会话迁移")
+            self.root.geometry("840x720")
+            self.root.minsize(680, 640)
+            self.root.configure(background="#f5f7fa")
+            self.root.protocol("WM_DELETE_WINDOW", self.close)
+            self.mode = tk.StringVar(value="export")
+            self.home = tk.StringVar(value=os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+            self.archive = tk.StringVar(value=str(Path(__file__).resolve().with_name("codex-chats.zip")))
+            self.skills = tk.BooleanVar(value=True)
+            self.status = tk.StringVar(value="就绪")
+            style = ttk.Style(root)
+            style.theme_use("clam")
+            style.configure(".", font=("Microsoft YaHei UI", 10))
+            style.configure("TFrame", background="#f5f7fa")
+            style.configure("TLabel", background="#f5f7fa", foreground="#172b45")
+            style.configure("Title.TLabel", font=("Microsoft YaHei UI", 20, "bold"))
+            style.configure("Hint.TLabel", foreground="#465a70")
+            style.configure("TButton", padding=(14, 9))
+            style.configure("Primary.TButton", foreground="white", background="#245c9a")
+            style.map("Primary.TButton", background=[("disabled", "#d7dfe9"), ("active", "#174679")],
+                      foreground=[("disabled", "#536376")])
+            style.configure("TRadiobutton", background="#f5f7fa", padding=(0, 9))
+            style.configure("TCheckbutton", background="#f5f7fa")
+            self.controls = []
+            self.root.columnconfigure(0, weight=1)
+            self.root.rowconfigure(0, weight=1)
+            body = ttk.Frame(root, padding=28)
+            body.grid(sticky="nsew")
+            body.columnconfigure(0, weight=1)
+            body.rowconfigure(9, weight=1)
+            ttk.Label(body, text="Codex 项目会话迁移", style="Title.TLabel").grid(sticky="w")
+            ttk.Label(body, text="迁移聊天、分页历史、项目分组和 Skills", style="Hint.TLabel").grid(
+                sticky="w", pady=(6, 18))
+            modes = ttk.Frame(body)
+            modes.grid(row=2, sticky="ew", pady=(0, 14))
+            for mode, label in (("export", "导出会话"), ("import", "导入会话"), ("cleanup", "清理旧文件")):
+                button = ttk.Radiobutton(modes, text=label, value=mode, variable=self.mode)
+                button.pack(side="left", padx=(0, 28))
+                self.controls.append(button)
+            self.path_field(body, 3, "Codex 数据目录", self.home, self.choose_home)
+            self.archive_entry, self.archive_button = self.path_field(
+                body, 4, "会话 ZIP", self.archive, self.choose_archive)
+            options = ttk.Frame(body)
+            options.grid(row=5, sticky="ew", pady=(4, 12))
+            self.skills_button = ttk.Checkbutton(options, text="同时迁移用户 Skills", variable=self.skills)
+            self.skills_button.pack(side="left")
+            self.controls.append(self.skills_button)
+            self.hint = ttk.Label(body, style="Hint.TLabel", wraplength=740)
+            self.hint.grid(row=6, sticky="ew", pady=(0, 14))
+            actions = ttk.Frame(body)
+            actions.grid(row=7, sticky="ew", pady=(0, 18))
+            self.preview_button = ttk.Button(actions, text="预览", command=lambda: self.start(True))
+            self.preview_button.pack(side="left")
+            self.run_button = ttk.Button(actions, text="开始导出", style="Primary.TButton",
+                                         command=lambda: self.start(False))
+            self.run_button.pack(side="left", padx=12)
+            self.controls.extend((self.preview_button, self.run_button))
+            ttk.Label(body, text="运行记录").grid(row=8, sticky="w", pady=(0, 8))
+            log_frame = ttk.Frame(body)
+            log_frame.grid(row=9, sticky="nsew")
+            log_frame.columnconfigure(0, weight=1)
+            log_frame.rowconfigure(0, weight=1)
+            self.log = tk.Text(log_frame, wrap="word", state="disabled", background="white",
+                               foreground="#23374d", font=("Microsoft YaHei UI", 10),
+                               relief="solid", borderwidth=1, padx=12, pady=10)
+            self.log.grid(sticky="nsew")
+            scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
+            scrollbar.grid(row=0, column=1, sticky="ns")
+            self.log.configure(yscrollcommand=scrollbar.set)
+            footer = ttk.Frame(body)
+            footer.grid(row=10, sticky="ew", pady=(14, 0))
+            footer.columnconfigure(0, weight=1)
+            ttk.Label(footer, textvariable=self.status).grid(sticky="w")
+            self.progress = ttk.Progressbar(footer, mode="indeterminate", length=140)
+            self.progress.grid(row=0, column=1, sticky="e")
+            for variable in (self.mode, self.home, self.archive, self.skills):
+                variable.trace_add("write", self.selection_changed)
+            root.bind("<Configure>", lambda event: self.hint.configure(
+                wraplength=max(400, body.winfo_width() - 56)) if event.widget == root else None)
+            self.selection_changed()
+            self.write_log("选择操作，核对路径后先预览。正式迁移或清理前，请完全退出 Codex。\n")
+            self.root.after(100, self.poll)
+
+        def path_field(self, body, row, label, variable, command):
+            frame = ttk.Frame(body)
+            frame.grid(row=row, sticky="ew", pady=(0, 14))
+            frame.columnconfigure(0, weight=1)
+            ttk.Label(frame, text=label).grid(row=0, column=0, sticky="w", pady=(0, 6))
+            entry = ttk.Entry(frame, textvariable=variable)
+            entry.grid(row=1, column=0, sticky="ew")
+            button = ttk.Button(frame, text="选择…", command=command)
+            button.grid(row=1, column=1, padx=(10, 0))
+            self.controls.extend((entry, button))
+            return entry, button
+
+        def choose_home(self):
+            value = filedialog.askdirectory(parent=self.root, title="选择 Codex 数据目录",
+                                             initialdir=self.home.get())
+            if value:
+                self.home.set(value)
+
+        def choose_archive(self):
+            options = dict(parent=self.root, filetypes=[("ZIP 文件", "*.zip")],
+                           initialdir=str(Path(self.archive.get()).parent))
+            if self.mode.get() == "export":
+                value = filedialog.asksaveasfilename(
+                    title="导出到 ZIP", defaultextension=".zip", confirmoverwrite=False,
+                    initialfile=Path(self.archive.get()).name, **options)
+            else:
+                value = filedialog.askopenfilename(title="选择会话 ZIP", **options)
+            if value:
+                self.archive.set(value)
+
+        def selection_changed(self, *_):
+            self.cleanup_preview = None
+            self.refresh_controls()
+
+        def refresh_controls(self):
+            for widget in self.controls:
+                widget.configure(state="disabled" if self.running else "normal")
+            mode = self.mode.get()
+            cleanup_mode = mode == "cleanup"
+            if cleanup_mode:
+                for widget in (self.archive_entry, self.archive_button, self.skills_button):
+                    widget.configure(state="disabled")
+            labels = {"export": "开始导出", "import": "开始导入", "cleanup": "清理预览中的文件"}
+            self.run_button.configure(text=labels[mode])
+            if cleanup_mode and self.cleanup_preview != self.home.get():
+                self.run_button.configure(state="disabled")
+            hints = {
+                "export": "自动识别项目和 Section，保存会话及完整分页历史。导出路径应选择一个新 ZIP。",
+                "import": "读取 ZIP，恢复项目分组和聊天。缺失的项目目录会按原路径创建，重复导入会保留已有记录。",
+                "cleanup": "只清理超过 7 天的导入备份和全局状态写入临时文件，保留最新一份导入备份。请先预览。",
+            }
+            self.hint.configure(text=hints[mode])
+
+        def write_log(self, text):
+            self.log.configure(state="normal")
+            self.log.insert("end", text)
+            self.log.see("end")
+            self.log.configure(state="disabled")
+
+        def start(self, preview):
+            if self.running:
+                return
+            mode = self.mode.get()
+            if not self.home.get().strip() or (mode != "cleanup" and not self.archive.get().strip()):
+                messagebox.showerror("路径不完整", "请选择 Codex 数据目录和会话 ZIP。", parent=self.root)
+                return
+            apply = mode == "cleanup" and not preview
+            if apply:
+                if self.cleanup_preview != self.home.get():
+                    return
+                if not messagebox.askyesno("确认清理", "将重新检查并永久删除符合条件的旧文件。\n"
+                                          "删除的旧备份将失去对应的回退能力。确认继续？", parent=self.root):
+                    return
+            home = self.home.get()
+            command = [sys.executable, "-u", str(Path(__file__).resolve()), mode,
+                       "--codex-home", home]
+            if mode != "cleanup":
+                command.insert(4, self.archive.get())
+                if not self.skills.get():
+                    command.append("--exclude-skills")
+                if preview:
+                    command.append("--preview")
+            elif apply:
+                command.append("--apply")
+            self.running = True
+            self.cleanup_preview = None
+            self.status.set("正在预览…" if preview else "正在处理…")
+            self.write_log("\n" + ("预览" if preview else "执行") +
+                           {"export": "导出", "import": "导入", "cleanup": "清理"}[mode] + "\n")
+            self.refresh_controls()
+            self.progress.start(12)
+            threading.Thread(target=self.worker, args=(command, mode, preview, home), daemon=True).start()
+
+        def worker(self, command, mode, preview, home):
+            try:
+                environment = os.environ.copy()
+                environment["PYTHONIOENCODING"] = "utf-8"
+                with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      text=True, encoding="utf-8", errors="replace", env=environment,
+                                      creationflags=subprocess.CREATE_NO_WINDOW) as process:
+                    for line in process.stdout:
+                        self.events.put(("log", line))
+                    code = process.wait()
+                self.events.put(("done", (code, mode, preview, home)))
+            except Exception as error:
+                self.events.put(("log", str(error) + "\n"))
+                self.events.put(("done", (1, mode, preview, home)))
+
+        def poll(self):
+            try:
+                while True:
+                    kind, value = self.events.get_nowait()
+                    if kind == "log":
+                        self.write_log(value)
+                    else:
+                        code, mode, preview, home = value
+                        self.running = False
+                        self.progress.stop()
+                        if code == 0:
+                            self.status.set("预览完成" if preview else "操作完成")
+                            if mode == "cleanup" and preview:
+                                self.cleanup_preview = home
+                        else:
+                            self.status.set("操作未完成，请查看运行记录")
+                        self.refresh_controls()
+            except queue.Empty:
+                pass
+            self.root.after(100, self.poll)
+
+        def close(self):
+            if self.running:
+                messagebox.showinfo("任务进行中", "请等待任务结束后再关闭窗口。", parent=self.root)
+            else:
+                self.root.destroy()
+
+    root = tk.Tk()
+    TransferWindow(root)
+    root.mainloop()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("export", "import"))
+    parser.add_argument("mode", choices=("export", "import", "cleanup", "gui"))
     parser.add_argument("archive", nargs="?", type=Path,
                         default=Path(__file__).resolve().with_name("codex-chats.zip"),
                         help="ZIP path (default: codex-chats.zip beside this script)")
     parser.add_argument("--codex-home", type=Path, default=Path(os.environ.get(
         "CODEX_HOME", str(Path.home() / ".codex"))))
     parser.add_argument("--preview", action="store_true")
+    parser.add_argument("--apply", action="store_true",
+                        help="Delete the old files listed by cleanup (default: preview only)")
     skill_options = parser.add_mutually_exclusive_group()
     skill_options.add_argument("--include-skills", dest="include_skills", action="store_true",
                                help="Transfer user skills (default)")
@@ -703,14 +1015,23 @@ def main():
     parser.set_defaults(include_skills=True)
     parser.add_argument("--provider", help="Optional target model_provider for imported thread rows")
     if len(sys.argv) == 1:
-        parser.print_help()
+        launch_gui()
         return
     args = parser.parse_args()
+    if args.apply and args.mode != "cleanup":
+        parser.error("--apply is only valid with cleanup")
+    if args.apply and args.preview:
+        parser.error("--apply and --preview cannot be combined")
+    if args.mode == "gui":
+        launch_gui()
+        return
     home, archive = args.codex_home.resolve(), args.archive.resolve()
     if args.mode == "export":
         export(home, archive, args.preview, args.include_skills)
-    else:
+    elif args.mode == "import":
         import_bundle(home, archive, args.preview, args.provider, args.include_skills)
+    else:
+        cleanup(home, args.apply)
 
 
 if __name__ == "__main__":
